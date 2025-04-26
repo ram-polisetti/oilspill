@@ -1,0 +1,11 @@
+torch>=2.0.0
+ultralytics
+albumentations
+opencv-python
+numpy
+wandb
+pytest>=7.0.0
+typing-extensions>=4.0.0
+tqdm>=4.64.0
+scikit-learn>=1.0.0
+pillow>=9.0.0
