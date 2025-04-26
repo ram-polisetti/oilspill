@@ -3,8 +3,8 @@ import numpy as np
 import cv2
 from torch.utils.data import Dataset
 
-class ZenodoDataset(Dataset):
-    """Dataset handler for Zenodo SAR imagery dataset for oil spill detection."""
+class ZENONODODataset(Dataset):
+    """Dataset handler for ZENONODO SAR imagery dataset for oil spill detection."""
 
     def __init__(self, 
                  image_paths: List[str],

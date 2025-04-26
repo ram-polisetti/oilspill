@@ -8,7 +8,7 @@ def get_training_config() -> Dict:
     """
     return {
         'epochs': 100,
-        'batch_size': 16,
+        'batch_size': 16,  # Optimized for 16GB RAM
         'initial_lr': 1e-4,
         'validation_interval': 5,
         'image_size': 256,
@@ -17,9 +17,9 @@ def get_training_config() -> Dict:
         'seg_weight': 0.6,
         'augmentation_prob': 0.5,
         'pretrained': True,
-        'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-        'num_workers': 4,
-        'pin_memory': True,
+        'device': 'mps',  # Use Metal Performance Shaders for M-series
+        'num_workers': 6,  # Increased for M-series efficiency
+        'pin_memory': True,  # Keep True for better memory management
         'checkpoint_dir': 'checkpoints',
         'log_interval': 100,
         # Zenodo dataset configuration

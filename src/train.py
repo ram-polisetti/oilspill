@@ -21,6 +21,18 @@ def parse_args():
 def main():
     args = parse_args()
     
+    # Validate data directory
+    if not os.path.exists(args.data_dir):
+        raise FileNotFoundError(f"Data directory {args.data_dir} does not exist")
+    
+    # Validate dataset structure
+    required_dirs = ['train/images', 'train/masks', 'train/labels',
+                    'val/images', 'val/masks', 'val/labels']
+    for dir_path in required_dirs:
+        full_path = os.path.join(args.data_dir, dir_path)
+        if not os.path.exists(full_path):
+            raise FileNotFoundError(f"Required directory {full_path} not found")
+    
     # Load configurations
     train_config = get_training_config()
     model_config = get_model_config()
@@ -70,12 +82,19 @@ def main():
         pin_memory=train_config['pin_memory']
     )
     
-    # Initialize model and loss
-    model = HybridModel(pretrained=model_config['use_pretrained'])
-    criterion = HybridLoss(
-        det_weight=train_config['det_weight'],
-        seg_weight=train_config['seg_weight']
-    )
+    # Initialize model and loss with error handling
+    try:
+        model = HybridModel(pretrained=model_config['use_pretrained'])
+        criterion = HybridLoss(
+            det_weight=train_config['det_weight'],
+            seg_weight=train_config['seg_weight']
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize model or loss: {str(e)}")
+        
+    # Validate model configuration
+    if not all(k in train_config for k in ['det_weight', 'seg_weight', 'device']):
+        raise ValueError("Missing required configuration parameters")
     
     # Move to device
     device = torch.device(train_config['device'])
