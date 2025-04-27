@@ -6,7 +6,7 @@ A deep learning-based system for detecting and segmenting oil spills in SAR (Syn
 
 - Hybrid architecture combining YOLOv8 for detection and U-Net++ for segmentation
 - SAR-specific data preprocessing with speckle reduction and calibration
-- Feature fusion mechanism for improved performance
+- Transfer learning with frozen YOLO backbone for efficient training
 - Comprehensive training pipeline with Metal Performance Shaders (MPS) support
 - Modular and extensible codebase
 
@@ -33,43 +33,39 @@ oilspill/
 
 ### Hybrid Model
 
-The system uses a hybrid architecture that combines:
-- **YOLOv8**: For object detection and localization of oil spills
-- **U-Net++**: For precise segmentation of oil spill regions
-- **Feature Fusion**: Custom module to combine features from both networks
+The system uses a transfer learning-based hybrid architecture that combines:
+- **YOLOv8**: Pre-trained backbone for object detection with fine-tuned detection head
+- **U-Net++**: Custom decoder for precise segmentation using YOLO backbone features
+- **Transfer Learning**: Frozen YOLO backbone with trainable detection head for efficient learning
 
 ```python
 class HybridModel(nn.Module):
     def __init__(self, pretrained: bool = True):
         super().__init__()
-        # Initialize YOLO backbone
+        # Initialize YOLO backbone with transfer learning
         self.detector = YOLO('yolov8n.pt')
         if not pretrained:
             self.detector = self.detector.model
             
-        # Initialize U-Net++ components
-        self.fusion = FeatureFusion(1024)  # Adjust channels based on YOLO feature maps
+        # Freeze YOLO backbone layers
+        for param in self.detector.model.parameters():
+            param.requires_grad = False
+        
+        # Only fine-tune the detection head
+        for param in self.detector.model.head.parameters():
+            param.requires_grad = True
+            
+        # Initialize U-Net++ decoder for segmentation
         self.decoder = UNetPlusPlusDecoder(512)
 ```
 
 ### Key Components
 
-1. **Feature Fusion Module**
-   - Combines feature maps from YOLO and U-Net++
-   - Uses convolutional layers with batch normalization
-   - Reduces channel dimensions for efficient processing
-
-```python
-class FeatureFusion(nn.Module):
-    def __init__(self, in_channels: int):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels//2, 3, padding=1),
-            nn.BatchNorm2d(in_channels//2),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels//2, in_channels//2, 3, padding=1)
-        )
-```
+1. **Transfer Learning Architecture**
+   - Pre-trained YOLO backbone with frozen layers
+   - Fine-tuned detection head for domain adaptation
+   - Efficient feature extraction for segmentation
+   - Reduced training time and improved convergence
 
 2. **U-Net++ Decoder**
    - Bilinear upsampling for feature maps
@@ -173,39 +169,47 @@ Key training parameters (configurable in `config.py`):
 
 ### Training Configuration & Deployment
 
-1. **Hardware Setup**
+1. **Lightning AI Integration**
    ```python
-   # Configure hardware in trainer initialization
+   # Lightning-based trainer with cloud support
    trainer = Trainer(
        model=model,
-       accelerator="gpu",  # or "cpu", "tpu", "auto"
-       devices="auto",    # or specific number like 2
-       strategy="ddp",    # or "deepspeed", "fsdp"
-       config={
-           'initial_lr': 1e-4,
-           'epochs': 100,
-           'patience': 10
-       }
+       accelerator="auto",  # Automatic hardware detection
+       devices=-1,         # Use all available devices
+       strategy="ddp",     # Distributed training support
+       callbacks=[
+           ModelCheckpoint(save_top_k=3, monitor='val_loss'),
+           EarlyStopping(monitor='val_loss', patience=10)
+       ],
+       automatic_optimization=True
    )
    ```
 
-2. **Training Launch**
+2. **Advanced Features**
+   - Automatic Mixed Precision (AMP) training
+   - Vectorized IoU calculation for efficient batch processing
+   - Cosine annealing learning rate scheduling
+   - WandB integration for experiment tracking
+   - Cloud-ready with checkpointing and early stopping
+
+3. **Training Launch**
    ```bash
-   # Single GPU training
-   python train.py --accelerator gpu --devices 1
+   # Single GPU training with MPS support
+   python train.py --accelerator mps --devices 1
    
-   # Multi-GPU training
-   python train.py --accelerator gpu --devices 4 --strategy ddp
+   # Multi-GPU distributed training
+   python train.py --accelerator gpu --devices -1 --strategy ddp
    
-   # CPU training
+   # CPU fallback
    python train.py --accelerator cpu
    ```
 
-3. **Performance Tips**
-   - Use `strategy="ddp"` for distributed data parallel training
-   - Enable `automatic_optimization=True` for Lightning-managed training
-   - Adjust batch size based on available GPU memory
-   - Monitor GPU utilization and adjust learning rate accordingly
+4. **Performance Optimization**
+   - Automatic hardware detection and configuration
+   - Gradient scaling for numerical stability
+   - Efficient batch processing with vectorized operations
+   - Real-time metrics visualization
+   - Comprehensive validation metrics tracking
 
 ## Requirements
 
