@@ -37,35 +37,42 @@ class UNetPlusPlusDecoder(nn.Module):
         return torch.sigmoid(self.conv(x))
 
 class HybridModel(nn.Module):
-    """Hybrid architecture combining YOLOv8 and U-Net++ for oil spill detection."""
+    """Hybrid architecture combining YOLOv8 and U-Net++ for oil spill detection using transfer learning."""
     
     def __init__(self, pretrained: bool = True):
         super().__init__()
-        # Initialize YOLO backbone
+        # Initialize YOLO backbone with transfer learning
         self.detector = YOLO('yolov8n.pt')
         if not pretrained:
             self.detector = self.detector.model
+        
+        # Freeze YOLO backbone layers
+        for param in self.detector.model.parameters():
+            param.requires_grad = False
+        
+        # Only fine-tune the detection head
+        for param in self.detector.model.head.parameters():
+            param.requires_grad = True
             
-        # Initialize U-Net++ components
-        self.fusion = FeatureFusion(1024)  # Adjust channels based on YOLO feature maps
+        # Initialize U-Net++ decoder for segmentation
         self.decoder = UNetPlusPlusDecoder(512)
         
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # Get YOLO features and predictions
         det_output = self.detector(x)
-        det_features = det_output.feature_maps[-1]  # Use the deepest feature map
+        det_features = self.detector.model.backbone(x)[-1]  # Extract backbone features
         
-        # Fusion and segmentation
-        fused_features = self.fusion(det_features, det_features)
-        mask_pred = self.decoder(fused_features)
+        # Segmentation using backbone features
+        mask_pred = self.decoder(det_features)
         
         return det_output, mask_pred
 
 class HybridLoss(nn.Module):
     """Custom loss combining detection and segmentation losses."""
     
-    def __init__(self, det_weight: float = 0.4, seg_weight: float = 0.6):
+    def __init__(self, detector: YOLO, det_weight: float = 0.4, seg_weight: float = 0.6):
         super().__init__()
+        self.detector = detector
         self.det_weight = det_weight
         self.seg_weight = seg_weight
         self.seg_criterion = nn.BCEWithLogitsLoss()

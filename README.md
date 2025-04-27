@@ -5,9 +5,9 @@ A deep learning-based system for detecting and segmenting oil spills in SAR (Syn
 ## Features
 
 - Hybrid architecture combining YOLOv8 for detection and U-Net++ for segmentation
-- SAR-specific data preprocessing and augmentation pipeline
+- SAR-specific data preprocessing with speckle reduction and calibration
 - Feature fusion mechanism for improved performance
-- Comprehensive training pipeline with Weights & Biases integration
+- Comprehensive training pipeline with Metal Performance Shaders (MPS) support
 - Modular and extensible codebase
 
 ## Project Structure
@@ -16,8 +16,10 @@ A deep learning-based system for detecting and segmenting oil spills in SAR (Syn
 oilspill/
 ├── src/
 │   ├── data_pipeline/
-│   │   ├── dataset.py        # ZENODO dataset handler
-│   │   └── augmentation.py   # Data augmentation pipeline
+│   │   ├── __init__.py
+│   │   ├── dataset.py        # ZENONODO dataset handler
+│   │   ├── augmentation.py   # Data augmentation pipeline
+│   │   └── zenodo_loader.py  # Dataset loading utilities
 │   ├── models/
 │   │   └── hybrid_model.py   # YOLOv8 + U-Net++ architecture
 │   ├── training/
@@ -25,7 +27,6 @@ oilspill/
 │   ├── configs/
 │   │   └── config.py         # Configuration parameters
 │   └── train.py              # Main training script
-└── requirements.txt          # Project dependencies
 ```
 
 ## Model Architecture
@@ -38,27 +39,17 @@ The system uses a hybrid architecture that combines:
 - **Feature Fusion**: Custom module to combine features from both networks
 
 ```python
-# models/hybrid_model.py
-class OilSpillHybridModel(nn.Module):
-    def __init__(self):
+class HybridModel(nn.Module):
+    def __init__(self, pretrained: bool = True):
         super().__init__()
-        self.yolo = YOLOv8('yolov8n.pt')
-        self.unetpp = UNetPlusPlus(in_channels=3, out_channels=1)
-        self.fusion = FeatureFusionModule()
-        
-    def forward(self, x):
-        # YOLO detection branch
-        yolo_features = self.yolo.backbone(x)
-        detection_output = self.yolo.head(yolo_features)
-        
-        # U-Net++ segmentation branch
-        seg_features = self.unetpp.encoder(x)
-        
-        # Feature fusion
-        fused_features = self.fusion(yolo_features, seg_features)
-        segmentation_output = self.unetpp.decoder(fused_features)
-        
-        return detection_output, segmentation_output
+        # Initialize YOLO backbone
+        self.detector = YOLO('yolov8n.pt')
+        if not pretrained:
+            self.detector = self.detector.model
+            
+        # Initialize U-Net++ components
+        self.fusion = FeatureFusion(1024)  # Adjust channels based on YOLO feature maps
+        self.decoder = UNetPlusPlusDecoder(512)
 ```
 
 ### Key Components
@@ -69,20 +60,15 @@ class OilSpillHybridModel(nn.Module):
    - Reduces channel dimensions for efficient processing
 
 ```python
-class FeatureFusionModule(nn.Module):
-    def __init__(self, in_channels=512):
+class FeatureFusion(nn.Module):
+    def __init__(self, in_channels: int):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels * 2, in_channels, 1)
-        self.bn1 = nn.BatchNorm2d(in_channels)
-        self.conv2 = nn.Conv2d(in_channels, in_channels // 2, 3, padding=1)
-        self.bn2 = nn.BatchNorm2d(in_channels // 2)
-        
-    def forward(self, yolo_feat, unet_feat):
-        # Concatenate features along channel dimension
-        x = torch.cat([yolo_feat, unet_feat], dim=1)
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))
-        return x
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels//2, 3, padding=1),
+            nn.BatchNorm2d(in_channels//2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels//2, in_channels//2, 3, padding=1)
+        )
 ```
 
 2. **U-Net++ Decoder**
@@ -98,67 +84,45 @@ class FeatureFusionModule(nn.Module):
 
 ### Dataset Handler
 
-The `ZenodoDataset` class provides:
+The `ZENONODODataset` class provides:
 - SAR-specific preprocessing including speckle reduction
 - Support for both image masks and bounding boxes
 - Dynamic data augmentation pipeline
 - Efficient batch processing
 
 ```python
-# data_pipeline/dataset.py
-class ZenodoDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
-        self.root_dir = root_dir
+class ZENONODODataset(Dataset):
+    def __init__(self, 
+                 image_paths: List[str],
+                 mask_paths: Optional[List[str]] = None,
+                 bbox_paths: Optional[List[str]] = None,
+                 transform=None,
+                 image_size: int = 256):
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.bbox_paths = bbox_paths
         self.transform = transform
-        self.samples = self._load_dataset()
-        
-    def __getitem__(self, idx):
-        img_path = self.samples[idx]['image']
-        mask_path = self.samples[idx]['mask']
-        bbox = self.samples[idx]['bbox']
-        
-        # Load and preprocess SAR image
-        image = self._load_sar_image(img_path)
-        mask = self._load_mask(mask_path)
-        
-        if self.transform:
-            image, mask, bbox = self.transform(image, mask, bbox)
-            
-        return {
-            'image': image,
-            'mask': mask,
-            'bbox': bbox
-        }
+        self.image_size = image_size
 ```
 
 ### Preprocessing Steps
 
 1. Speckle reduction using Gaussian filtering
 2. Image calibration and normalization
-3. Resizing to configured dimensions
-4. Optional data augmentation
+3. Resizing to configured dimensions (256x256)
+4. Optional data augmentation using albumentations
 
 ```python
-# data_pipeline/augmentation.py
-class SARPreprocessing:
-    def __init__(self, img_size=256):
-        self.img_size = img_size
-        
-    def __call__(self, image):
-        # Speckle reduction
-        image = cv2.GaussianBlur(image, (3, 3), 0)
-        
-        # Calibration and normalization
-        image = self._calibrate_sar(image)
-        image = (image - image.mean()) / image.std()
-        
-        # Resize
-        image = cv2.resize(image, (self.img_size, self.img_size))
-        return image
-        
-    def _calibrate_sar(self, image):
-        # SAR-specific calibration
-        return 10 * np.log10(image + 1e-10)
+def get_augmentation_pipeline(p: float = 0.5) -> A.Compose:
+    return A.Compose([
+        A.HorizontalFlip(p=p),
+        A.VerticalFlip(p=p),
+        A.RandomRotate90(p=p),
+        A.Rotate(limit=10, p=p),
+        A.RandomBrightnessContrast(p=p),
+        A.GaussNoise(var_limit=(10.0, 50.0), p=p),
+        A.GridDistortion(p=p/2)
+    ])
 ```
 
 ## Training Pipeline
@@ -167,79 +131,81 @@ class SARPreprocessing:
 
 Key training parameters (configurable in `config.py`):
 - Epochs: 100
-- Batch size: 16
+- Batch size: 16 (auto-scaled for distributed training)
 - Initial learning rate: 1e-4
 - Validation interval: 5 epochs
 - Image size: 256x256
 - Loss weights: 0.4 (detection), 0.6 (segmentation)
 
-```python
-# configs/config.py
-class Config:
-    # Training parameters
-    EPOCHS = 100
-    BATCH_SIZE = 16
-    LEARNING_RATE = 1e-4
-    VAL_INTERVAL = 5
-    
-    # Model parameters
-    IMG_SIZE = 256
-    DETECTION_WEIGHT = 0.4
-    SEGMENTATION_WEIGHT = 0.6
-    
-    # Dataset parameters
-    DATA_ROOT = 'path/to/zenodo/dataset'
-    NUM_WORKERS = 4
-    
-    # Optimizer parameters
-    WEIGHT_DECAY = 1e-4
-    BETAS = (0.9, 0.999)
-```
+### Model Architecture & Training
 
-### Training Features
-
-1. **Optimizer and Scheduler**
-   - AdamW optimizer with weight decay
-   - Cosine annealing learning rate scheduler
-
-2. **Metrics Tracking**
-   - Training and validation loss
-   - Detection accuracy
-   - Segmentation IoU score
-
-3. **Checkpointing**
-   - Saves best model based on validation loss
-   - Stores optimizer state for training resumption
-
-4. **Weights & Biases Integration**
-   - Real-time metric logging
-   - Experiment tracking and comparison
-
-## Usage
-
-1. **Installation**
-   ```bash
-   pip install -r requirements.txt
+1. **Transfer Learning Implementation**
+   ```python
+   class Trainer(L.LightningModule):
+       def __init__(self, model, train_loader, val_loader, criterion, config):
+           self.model = model  # Pre-trained backbone with custom heads
+           self.criterion = criterion
+           self.automatic_optimization = True
+           
+           # Metrics initialization
+           self.precision = Precision(task='binary', sync_dist=True)
+           self.recall = Recall(task='binary', sync_dist=True)
+           self.f1_score = F1Score(task='binary', sync_dist=True)
    ```
 
-2. **Data Preparation**
-   - Download the Zenodo SAR dataset
-   - Update dataset path in config.py
+2. **Training Features**
+   - Automatic mixed precision (AMP) for faster training
+   - Vectorized IoU calculation for efficient batch processing
+   - Advanced metrics tracking (Precision, Recall, F1-Score)
+   - Cosine annealing learning rate scheduling
 
-3. **Training**
-   ```bash
-   python src/train.py --config src/configs/config.py
+3. **Performance Optimization**
+   - Distributed training with DDP strategy
+   - Gradient scaling for numerical stability
+   - Early stopping with configurable patience
+   - Automatic device detection and GPU optimization
+
+4. **Monitoring & Checkpointing**
+   - Top-k model checkpointing
+   - WandB integration for experiment tracking
+   - Real-time metrics visualization
+   - Comprehensive validation metrics
+
+### Training Configuration & Deployment
+
+1. **Hardware Setup**
+   ```python
+   # Configure hardware in trainer initialization
+   trainer = Trainer(
+       model=model,
+       accelerator="gpu",  # or "cpu", "tpu", "auto"
+       devices="auto",    # or specific number like 2
+       strategy="ddp",    # or "deepspeed", "fsdp"
+       config={
+           'initial_lr': 1e-4,
+           'epochs': 100,
+           'patience': 10
+       }
+   )
    ```
 
-4. **Monitoring**
-   - Access training metrics through Weights & Biases dashboard
-   - Monitor validation metrics every 5 epochs
+2. **Training Launch**
+   ```bash
+   # Single GPU training
+   python train.py --accelerator gpu --devices 1
+   
+   # Multi-GPU training
+   python train.py --accelerator gpu --devices 4 --strategy ddp
+   
+   # CPU training
+   python train.py --accelerator cpu
+   ```
 
-## Model Performance
-
-- Detection Accuracy: [To be updated]
-- Segmentation IoU: [To be updated]
-- Inference Speed: [To be updated]
+3. **Performance Tips**
+   - Use `strategy="ddp"` for distributed data parallel training
+   - Enable `automatic_optimization=True` for Lightning-managed training
+   - Adjust batch size based on available GPU memory
+   - Monitor GPU utilization and adjust learning rate accordingly
 
 ## Requirements
 
@@ -247,6 +213,6 @@ class Config:
 - PyTorch 1.8+
 - Ultralytics (YOLOv8)
 - OpenCV
-- Weights & Biases
+- Albumentations
 
 Refer to `requirements.txt` for complete dependencies.

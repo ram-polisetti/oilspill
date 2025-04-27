@@ -4,30 +4,64 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import wandb
+import lightning as L
+from lightning.fabric.strategies import DDPStrategy
 from torch.cuda.amp import autocast, GradScaler
 from torchmetrics import Precision, Recall, F1Score
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
 
-class Trainer:
-    """Trainer class for the hybrid oil spill detection model."""
+class Trainer(L.LightningModule):
+    """Trainer class for the hybrid oil spill detection model with Lightning integration."""
     
     def __init__(self,
                  model: torch.nn.Module,
                  train_loader: DataLoader,
                  val_loader: DataLoader,
                  criterion: torch.nn.Module,
-                 config: Dict):
+                 config: Dict,
+                 accelerator: str = "auto",
+                 strategy: str = "ddp",
+                 devices: int = -1):
+        super().__init__()
+        
+        # Lightning specific configurations
+        self.automatic_optimization = True
+        self.save_hyperparameters(config)
+        
+        # Training strategy setup
+        self.accelerator = accelerator
+        self.strategy = DDPStrategy() if strategy == "ddp" else strategy
+        self.devices = devices
+        
         # Initialize metrics
-        self.precision = Precision(task='binary')
-        self.recall = Recall(task='binary')
-        self.f1_score = F1Score(task='binary')
+        self.precision = Precision(task='binary', sync_dist=True)
+        self.recall = Recall(task='binary', sync_dist=True)
+        self.f1_score = F1Score(task='binary', sync_dist=True)
         self.scaler = GradScaler()
         self.patience = config.get('patience', 10)
         self.patience_counter = 0
+        
+        # Initialize model and components
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.criterion = criterion
         self.config = config
+        
+        # Setup callbacks for cloud training
+        self.checkpoint_callback = ModelCheckpoint(
+            dirpath='checkpoints',
+            filename='oilspill-{epoch:02d}-{val_loss:.2f}',
+            save_top_k=3,
+            monitor='val_loss',
+            mode='min'
+        )
+        
+        self.early_stopping = EarlyStopping(
+            monitor='val_loss',
+            patience=self.patience,
+            mode='min'
+        )
         
         # Setup optimizer and scheduler
         self.optimizer = optim.AdamW(
@@ -44,165 +78,123 @@ class Trainer:
         self.best_val_loss = float('inf')
         self.best_val_accuracy = 0.0
         
-    def train_epoch(self) -> Dict[str, float]:
-        """Train for one epoch using mixed precision."""
-        self.model.train()
-        total_loss = 0
-        total_det_accuracy = 0
-        total_seg_iou = 0
+    def training_step(self, batch, batch_idx) -> Dict:
+        """Lightning training step with mixed precision support."""
+        # Move batch to device and optimize memory
+        images = batch['image']
+        bboxes = batch['bboxes']
+        masks = batch['mask']
         
-        with tqdm(self.train_loader, desc='Training') as pbar:
-            for batch in pbar:
-                self.optimizer.zero_grad()
-                
-                # Forward pass with mixed precision
-                with autocast():
-                    det_output, mask_pred = self.model(batch['image'])
-                    loss = self.criterion(
-                        det_output,
-                        mask_pred,
-                        batch['bboxes'],
-                        batch['mask']
-                    )
-                
-                # Backward pass with gradient scaling
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                
-                # Update metrics
-                total_loss += loss.item()
-                # Calculate detection accuracy and segmentation IoU
-                det_accuracy = self._calculate_detection_accuracy(det_output, batch['bboxes'])
-                seg_iou = self._calculate_segmentation_iou(mask_pred, batch['mask'])
-                
-                # Calculate additional metrics
-                precision = self.precision(mask_pred, batch['mask'])
-                recall = self.recall(mask_pred, batch['mask'])
-                f1 = self.f1_score(mask_pred, batch['mask'])
-                
-                total_det_accuracy += det_accuracy
-                total_seg_iou += seg_iou
-                
-                pbar.set_postfix({'loss': loss.item()})
+        # Forward pass with mixed precision
+        with autocast():
+            det_output, mask_pred = self.model(images)
+            loss = self.criterion(
+                det_output,
+                mask_pred,
+                bboxes,
+                masks
+            )
         
-        metrics = {
-            'train_loss': total_loss / len(self.train_loader),
-            'train_det_accuracy': total_det_accuracy / len(self.train_loader),
-            'train_seg_iou': total_seg_iou / len(self.train_loader),
-            'train_precision': self.precision.compute(),
-            'train_recall': self.recall.compute(),
-            'train_f1': self.f1_score.compute()
+        # Calculate metrics
+        det_accuracy = self._calculate_detection_accuracy(det_output, bboxes)
+        seg_iou = self._calculate_segmentation_iou(mask_pred, masks)
+        
+        # Calculate additional metrics
+        precision = self.precision(mask_pred, masks)
+        recall = self.recall(mask_pred, masks)
+        f1 = self.f1_score(mask_pred, masks)
+        
+        # Log metrics
+        self.log('train_loss', loss, prog_bar=True)
+        self.log('train_det_accuracy', det_accuracy, prog_bar=True)
+        self.log('train_seg_iou', seg_iou, prog_bar=True)
+        self.log('train_precision', precision)
+        self.log('train_recall', recall)
+        self.log('train_f1', f1)
+        
+        return {'loss': loss}
+    
+    def validation_step(self, batch, batch_idx) -> Dict:
+        """Lightning validation step."""
+        images = batch['image']
+        bboxes = batch['bboxes']
+        masks = batch['mask']
+        
+        det_output, mask_pred = self.model(images)
+        loss = self.criterion(
+            det_output,
+            mask_pred,
+            bboxes,
+            masks
+        )
+        
+        det_accuracy = self._calculate_detection_accuracy(det_output, bboxes)
+        seg_iou = self._calculate_segmentation_iou(mask_pred, masks)
+        
+        # Log metrics
+        self.log('val_loss', loss, prog_bar=True)
+        self.log('val_det_accuracy', det_accuracy, prog_bar=True)
+        self.log('val_seg_iou', seg_iou, prog_bar=True)
+        
+        return {'val_loss': loss}
+    
+    def configure_optimizers(self):
+        """Configure optimizers and learning rate schedulers with Lightning-specific settings."""
+        optimizer = optim.AdamW(
+            self.parameters(),
+            lr=self.config['initial_lr'],
+            weight_decay=0.01
+        )
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=self.config['epochs']
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+                "frequency": 1,
+                "interval": "epoch"
+            }
         }
         
-        return metrics
+    def train_dataloader(self):
+        """Return the training dataloader."""
+        return self.train_loader
     
-    def validate(self) -> Dict[str, float]:
-        """Validate the model."""
-        self.model.eval()
-        total_loss = 0
-        total_det_accuracy = 0
-        total_seg_iou = 0
-        
-        with torch.no_grad():
-            for batch in tqdm(self.val_loader, desc='Validation'):
-                det_output, mask_pred = self.model(batch['image'])
-                loss = self.criterion(
-                    det_output,
-                    mask_pred,
-                    batch['bboxes'],
-                    batch['mask']
-                )
-                
-                total_loss += loss.item()
-                det_accuracy = self._calculate_detection_accuracy(det_output, batch['bboxes'])
-                seg_iou = self._calculate_segmentation_iou(mask_pred, batch['mask'])
-                
-                total_det_accuracy += det_accuracy
-                total_seg_iou += seg_iou
-        
-        metrics = {
-            'val_loss': total_loss / len(self.val_loader),
-            'val_det_accuracy': total_det_accuracy / len(self.val_loader),
-            'val_seg_iou': total_seg_iou / len(self.val_loader)
-        }
-        
-        return metrics
-    
-    def train(self, experiment_name: Optional[str] = None):
-        """Full training loop."""
-        # Initialize wandb
-        if experiment_name:
-            wandb.init(project="oil_spill_detection", name=experiment_name)
-            wandb.config.update(self.config)
-        
-        for epoch in range(self.config['epochs']):
-            print(f"\nEpoch {epoch+1}/{self.config['epochs']}")
-            
-            # Training phase
-            train_metrics = self.train_epoch()
-            
-            # Validation phase
-            if (epoch + 1) % self.config['validation_interval'] == 0:
-                val_metrics = self.validate()
-                
-                # Early stopping check
-                if val_metrics['val_loss'] < self.best_val_loss:
-                    self.best_val_loss = val_metrics['val_loss']
-                    self.patience_counter = 0
-                    torch.save({
-                        'epoch': epoch,
-                        'model_state_dict': self.model.state_dict(),
-                        'optimizer_state_dict': self.optimizer.state_dict(),
-                        'val_loss': self.best_val_loss,
-                    }, f'checkpoints/best_model.pth')
-                
-                # Log metrics
-                if experiment_name:
-                    wandb.log({**train_metrics, **val_metrics})
-                else:
-                    self.patience_counter += 1
-                    if self.patience_counter >= self.patience:
-                        print(f"Early stopping triggered after {epoch + 1} epochs")
-                        break
-            
-            # Update learning rate
-            self.scheduler.step()
-        
-        if experiment_name:
-            wandb.finish()
+    def val_dataloader(self):
+        """Return the validation dataloader."""
+        return self.val_loader
     
     def _calculate_detection_accuracy(self, pred: torch.Tensor, target: torch.Tensor) -> float:
-        """Calculate detection accuracy using IoU threshold."""
+        """Calculate detection accuracy using IoU threshold with vectorized operations."""
         iou_threshold = 0.5
-        pred_boxes = pred.detach().cpu()
-        target_boxes = target.detach().cpu()
+        pred_boxes = pred.detach()
+        target_boxes = target.detach()
         
-        # Calculate IoU for each prediction-target pair
-        def box_iou(box1, box2):
-            # Calculate intersection coordinates
-            x1 = max(box1[0], box2[0])
-            y1 = max(box1[1], box2[1])
-            x2 = min(box1[2], box2[2])
-            y2 = min(box1[3], box2[3])
-            
-            # Calculate intersection area
-            intersection = max(0, x2 - x1) * max(0, y2 - y1)
-            
-            # Calculate union area
-            box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
-            box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
-            union = box1_area + box2_area - intersection
-            
-            return intersection / (union + 1e-6)
+        # Vectorized IoU calculation
+        x1 = torch.max(pred_boxes[:, None, 0], target_boxes[None, :, 0])  # [N,M]
+        y1 = torch.max(pred_boxes[:, None, 1], target_boxes[None, :, 1])  # [N,M]
+        x2 = torch.min(pred_boxes[:, None, 2], target_boxes[None, :, 2])  # [N,M]
+        y2 = torch.min(pred_boxes[:, None, 3], target_boxes[None, :, 3])  # [N,M]
         
-        correct_detections = 0
+        # Calculate intersection area
+        intersection = torch.clamp(x2 - x1, min=0) * torch.clamp(y2 - y1, min=0)  # [N,M]
+        
+        # Calculate areas
+        pred_area = (pred_boxes[:, 2] - pred_boxes[:, 0]) * (pred_boxes[:, 3] - pred_boxes[:, 1])  # [N]
+        target_area = (target_boxes[:, 2] - target_boxes[:, 0]) * (target_boxes[:, 3] - target_boxes[:, 1])  # [M]
+        
+        # Calculate union area
+        union = pred_area[:, None] + target_area[None, :] - intersection  # [N,M]
+        
+        # Calculate IoU
+        iou = intersection / (union + 1e-6)  # [N,M]
+        
+        # Count correct detections
+        correct_detections = torch.sum(torch.max(iou, dim=1)[0] >= iou_threshold).item()
         total_detections = len(pred_boxes)
-        
-        for pred_box in pred_boxes:
-            max_iou = 0
-            for target_box in target_boxes:
-                iou = box_iou(pred_box, target_box)
                 max_iou = max(max_iou, iou)
             if max_iou >= iou_threshold:
                 correct_detections += 1
